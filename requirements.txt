@@ -1,0 +1,7 @@
+fastapi==0.115.12
+uvicorn==0.34.2
+pydantic==2.11.3
+python-multipart==0.0.20
+# blender_runner imports this to encode frames into stage.mp4; without it the render still
+# succeeds but the mp4 is silently skipped.
+imageio-ffmpeg==0.6.0

@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Blender 指令小剧场</title>
+  <style>
+    :root {
+      --bg: #141414;
+      --panel: #1e1e1e;
+      --line: #333;
+      --text: #ececec;
+      --muted: #9a9a9a;
+      --accent: #c4a574;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Segoe UI", "Microsoft YaHei", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+    }
+    main {
+      max-width: 980px;
+      margin: 0 auto;
+      padding: 32px 20px 64px;
+    }
+    h1 {
+      font-size: 28px;
+      font-weight: 600;
+      margin: 0 0 8px;
+    }
+    .sub { color: var(--muted); margin-bottom: 24px; }
+    .status {
+      font-size: 13px;
+      color: var(--muted);
+      margin-bottom: 16px;
+    }
+    .status.ok { color: #8fbf88; }
+    .status.bad { color: #d08a8a; }
+    .chips { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 16px; }
+    button.chip, button.go {
+      border: 1px solid var(--line);
+      background: var(--panel);
+      color: var(--text);
+      border-radius: 4px;
+      padding: 8px 12px;
+      cursor: pointer;
+    }
+    button.chip:hover, button.go:hover { border-color: var(--accent); color: var(--accent); }
+    textarea {
+      width: 100%;
+      min-height: 90px;
+      background: var(--panel);
+      color: var(--text);
+      border: 1px solid var(--line);
+      border-radius: 4px;
+      padding: 12px;
+      font-size: 16px;
+      resize: vertical;
+    }
+    .row { display: flex; gap: 12px; margin-top: 12px; align-items: center; }
+    button.go {
+      background: var(--accent);
+      color: #1a1a1a;
+      border: 0;
+      font-weight: 600;
+      padding: 10px 18px;
+    }
+    video, img.stage, canvas.stage, .placeholder {
+      width: 100%;
+      aspect-ratio: 16 / 9;
+      background: #101010;
+      border: 1px solid var(--line);
+      border-radius: 4px;
+      margin-top: 20px;
+      object-fit: contain;
+    }
+    .placeholder {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: var(--muted);
+    }
+    .log {
+      margin-top: 16px;
+      font-size: 13px;
+      color: var(--muted);
+      white-space: pre-wrap;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Blender 指令小剧场</h1>
+    <p class="sub">输入中文指令，后台调用本机 Blender 驱动模型。B 站凑企鹅是 <a href="https://www.bilibili.com/video/BV1iWht6JEnK/" style="color:var(--accent)">GMod 工坊模型</a>，请订阅后转成 glb/fbx 再导入本项目。</p>
+    <div id="status" class="status">正在检测 Blender…</div>
+    <p class="sub" id="gmodnote"></p>
+    <label class="sub">同场角色（可多选）</label>
+    <div id="cast" class="chips"></div>
+    <div class="row">
+      <input id="file" type="file" accept=".glb,.gltf,.fbx,.blend,.obj" />
+    </div>
+    <div class="chips" id="chips"></div>
+    <textarea id="prompt" placeholder="例如：挥手，然后鞠躬，再转一圈"></textarea>
+    <div class="row">
+      <button class="go" id="play">生成小剧场</button>
+      <span id="busy" class="sub"></span>
+    </div>
+    <div id="stage" class="placeholder">还没有成片</div>
+    <div class="log" id="log"></div>
+  </main>
+  <script>
+    const samples = ["挥手", "眨眼然后微笑", "张嘴说话", "生气", "点头然后挥手", "两个方块人挥手"];
+    const chips = document.getElementById("chips");
+    samples.forEach((text) => {
+      const b = document.createElement("button");
+      b.className = "chip";
+      b.textContent = text;
+      b.onclick = () => { document.getElementById("prompt").value = text; };
+      chips.appendChild(b);
+    });
+
+    async function loadModels(selected) {
+      const box = document.getElementById("cast");
+      const keep = new Set(
+        Array.from(box.querySelectorAll("input[type=checkbox]:checked")).map((el) => el.value)
+      );
+      if (selected) keep.add(selected);
+      if (keep.size === 0) keep.add("");
+      const data = await fetch("/api/models").then((r) => r.json());
+      const items = [
+        { name: "", label: "默认方块人" },
+        { name: "__default2__", label: "再加一名方块人" },
+      ].concat((data.models || []).map((m) => ({ name: m.name, label: m.name })));
+      box.innerHTML = "";
+      items.forEach((item) => {
+        const lab = document.createElement("label");
+        lab.className = "chip";
+        lab.style.cursor = "pointer";
+        const cb = document.createElement("input");
+        cb.type = "checkbox";
+        cb.value = item.name;
+        cb.checked = keep.has(item.name);
+        lab.appendChild(cb);
+        lab.appendChild(document.createTextNode(" " + item.label));
+        box.appendChild(lab);
+      });
+    }
+
+    async function loadStatus() {
+      const el = document.getElementById("status");
+      try {
+        const s = await fetch("/api/status").then((r) => r.json());
+        if (s.ready) {
+          el.className = "status ok";
+          el.textContent = "已连接 Blender：" + s.blender;
+        } else {
+          el.className = "status bad";
+          el.textContent = s.error || "未找到 Blender";
+        }
+        document.getElementById("gmodnote").textContent = s.gmod_note || "";
+      } catch (e) {
+        el.className = "status bad";
+        el.textContent = "服务未启动";
+      }
+      await loadModels();
+    }
+
+    document.getElementById("file").onchange = async (ev) => {
+      const file = ev.target.files && ev.target.files[0];
+      if (!file) return;
+      const body = new FormData();
+      body.append("file", file);
+      const res = await fetch("/api/models", { method: "POST", body });
+      const data = await res.json();
+      if (!res.ok) {
+        document.getElementById("log").textContent = JSON.stringify(data);
+        return;
+      }
+      await loadModels(data.name);
+    };
+
+    document.getElementById("play").onclick = async () => {
+      const instruction = document.getElementById("prompt").value.trim();
+      const busy = document.getElementById("busy");
+      const log = document.getElementById("log");
+      if (!instruction) return;
+      busy.textContent = "Blender 正在摆动作并渲染，大约十几秒…";
+      log.textContent = "";
+      try {
+        const res = await fetch("/api/play", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            instruction,
+            models: Array.from(document.querySelectorAll("#cast input[type=checkbox]:checked")).map((el) => el.value),
+          }),
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          throw new Error(JSON.stringify(data.detail || data, null, 2));
+        }
+        const names = (data.actions || []).map((a) => a.name).join(" → ");
+        log.textContent = "动作：" + names + "\n工程文件：" + (data.blend || "");
+        const box = document.getElementById("stage");
+        if (window._stageTimer) {
+          clearInterval(window._stageTimer);
+          window._stageTimer = null;
+        }
+        if (data.video_url) {
+          box.outerHTML = `<video id="stage" controls autoplay loop src="${data.video_url}?t=${Date.now()}"></video>`;
+        } else {
+          const count = data.frame_count || 0;
+          const canvas = document.createElement("canvas");
+          canvas.id = "stage";
+          canvas.className = "stage";
+          canvas.width = 960;
+          canvas.height = 540;
+          box.replaceWith(canvas);
+          const ctx = canvas.getContext("2d");
+          const stamp = Date.now();
+          const frames = [];
+          for (let n = 1; n <= count; n++) {
+            const im = new Image();
+            im.src = `/media/frames/frame_${String(n).padStart(4, "0")}.png?t=${stamp}`;
+            frames.push(im);
+          }
+          let i = 0;
+          const tick = () => {
+            const im = frames[i];
+            if (im && im.complete && im.naturalWidth) {
+              ctx.drawImage(im, 0, 0, canvas.width, canvas.height);
+            }
+            i = (i + 1) % Math.max(count, 1);
+          };
+          Promise.all(frames.map((im) => (im.decode ? im.decode().catch(() => {}) : Promise.resolve()))).then(tick);
+          window._stageTimer = setInterval(tick, 1000 / 24);
+        }
+      } catch (e) {
+        log.textContent = String(e);
+      } finally {
+        busy.textContent = "";
+      }
+    };
+
+    loadStatus();
+  </script>
+</body>
+</html>
