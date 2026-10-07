@@ -210,3 +210,20 @@ py -3.12 output\convert_all.py
 - **Windows 优先**。`engine/gmod.py` 和 `blender_runner.py` 里的路径探测（`Program Files`、
   `where blender`）都是 Windows 专有的，macOS/Linux 上要自己改。
 - **`/api/status` 会读 Steam 的 `appworkshop_4000.acf`**，只读，但毕竟碰了 Steam 的目录。
+
+---
+
+## 开发备忘
+
+**GitHub 推送在 SSH 上，不在 `gh` 上。**
+
+这台机器的网络只通 SSH（`github.com:22`），HTTPS API 被挡。所以：
+
+- `git push` 走 SSH，正常可用，remote 配成 `git@github.com:hyw20/<repo>.git`
+- `gh`（GitHub CLI 2.102.0）**装了但登录不了**：`gh auth login` 卡在
+  `POST https://github.com/login/device/code` 超时。因此 `gh repo create` 用不了，
+  建仓库得手动去 <https://github.com/new> 填名字，注意**不要勾 README / LICENSE / .gitignore**，
+  否则和本地首次提交会冲突。
+
+SSH key 在 `~/.ssh/id_ed25519_github`（`~/.ssh/config` 里已经配好了 Host 别名）。
+验证连接：`ssh -T git@github.com`，看到 `Hi hyw20!` 就是通的。
