@@ -142,7 +142,7 @@ VTF2TGA   = GMOD_BIN / "vtf2tga.exe"
 | `engine/models.py` | 66 | 列出/校验/上传 `models/` 下的模型；把前端勾选的多个模型拼成 cast（上限 6 个）。`*_arms.glb` 这类第一人称手臂模型会被过滤掉——只有手没有躯干，放到舞台上就是一块浮空三角形 |
 | `engine/blender_runner.py` | 123 | 定位 `blender.exe`（`BLENDER_EXE` → `Program Files\Blender Foundation\Blender*` → `%LOCALAPPDATA%\Programs` → `where blender`），写 job.json，起批处理子进程，读回 result.json，再用 ffmpeg 合成 mp4 |
 | `engine/gmod.py` | 97 | 只读地探测 Steam 上的 GMod 安装（AppID **4000**，目录名是 `GarrysMod`）和 `appworkshop_4000.acf` 里的订阅数，给前端显示一句提示 |
-| `blender_scripts/stage.py` | 579 | 整个渲染核心。方块人骨架、导入外部模型、骨骼别名表、15 个动作的关键帧、相机布光、渲帧 |
+| `blender_scripts/stage.py` | 754 | 整个渲染核心。方块人骨架、导入外部模型、骨骼别名表、程序化动作关键帧、**模型自带动画 NLA 播放、表情 shape keys 驱动**、相机布光、渲帧 |
 | `web/index.html` | 251 | 单页。状态探测、角色多选、模型上传、发指令、播成片（mp4 或 canvas 逐帧） |
 
 ### 骨骼是怎么对上的
@@ -155,6 +155,29 @@ VTF2TGA   = GMOD_BIN / "vtf2tga.exe"
 
 - **铰链轴向不同**：方块人的铰链在局部 X 上，ValveBiped 的骨头指向 +X，同一个旋转要换成 Z（`remap_euler()`，`stage.py:191`）。
 - **布料网格没有权重**：GMod PM 自带的裙摆面板（`Sm_PDSkirt_*`）完全没有蒙皮权重，不绑就会在世界空间里飘成一大片白帆。这些网格会被整体绑到 `Pelvis` 而不是删掉——删了包围盒会失真、取景就歪了（`stage.py:404-422`）。
+
+### 模型自带动画与表情（Blender 5.x）
+
+除了程序化插帧，`stage.py` 还消费模型自己带的资产，两条能力实测通过：
+
+- **自带动画**：glTF/FBX 导入后新增的 actions 会被收集（`import_model` 返回 `model_actions`），
+  指令命中 `MODEL_ACTION_KEYWORDS` 时优先用 NLA strip 播放模型自带 clip（`apply_model_action`），
+  否则回退程序化插帧。所以带 walk/idle/wave 动画的角色（如 Quaternius 的 CC0 角色包）
+  能直接「演」而不用我们逐骨摆。
+- **表情 shape keys**：`blink/wink/smile/talk/angry` 会驱动 mesh 真实的 blendshape
+  （`apply_expression_action`，0→1→0 关键帧）；模型没有对应 shape key 时静默回退到
+  程序化的 Jaw/眼睛骨骼动画。这样面部表情是模型作者做好的，不是我们凑的。
+
+两处 **Blender 5.x 特有的坑**，代码里都处理了：
+
+- **shape key 插帧不会自动建 action**：5.x 里 `keyframe_insert` 在 shape keys 上不再自动创建
+  `animation_data`/action，关键帧会静默丢失。`apply_expression_action` 里显式
+  `animation_data_create()` + 绑定 action，否则表情完全不动。
+- **active action 压死 NLA**：程序化插帧会写进 `animation_data.action`（active action），
+  而 active action 一旦存在就压住整条 NLA 求值，模型自带 strip 会全部失效（表现：画面静止）。
+  渲染前 `push_active_to_nla()` 把 active action 转成 NLA strip 再清空槽位，两条动画源共存。
+  另外 5.x 的 slotted action 没有 `Action.fcurves`，判空要用 `_action_has_curves()` 递归查
+  `layers[].strips[].channelbags[]`。
 
 ---
 

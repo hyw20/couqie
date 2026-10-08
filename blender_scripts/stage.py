@@ -373,6 +373,7 @@ def setup_stage(count: int = 1):
 def import_model(path: Path, name: str = "Actor", offset_x: float = 0.0) -> tuple:
     suffix = path.suffix.lower()
     before = set(bpy.data.objects)
+    actions_before = set(bpy.data.actions.keys())
     if suffix == ".blend":
         with bpy.data.libraries.load(str(path), link=False) as (data_from, data_to):
             data_to.objects = list(data_from.objects)
@@ -453,7 +454,18 @@ def import_model(path: Path, name: str = "Actor", offset_x: float = 0.0) -> tupl
 
     actor = arms[0] if arms else wrapper
     actor.name = name
-    return actor, imported
+
+    # 收集模型自带动画（glTF/FBX 导入后新增的 actions），然后清掉骨架上的默认绑定：
+    # glTF 导入器会把第一个动画挂到 armature 的 animation_data.action / NLA 上，渲染时会
+    # 与我们的程序化关键帧叠加打架。自带动画只在指令明确引用时才用（见 apply_model_action）。
+    model_actions = [a for a in bpy.data.actions if a.name not in actions_before]
+    for obj in imported:
+        if obj.type == "ARMATURE" and obj.animation_data:
+            if obj.animation_data.action:
+                obj.animation_data.action = None
+            for track in list(obj.animation_data.nla_tracks):
+                obj.animation_data.nla_tracks.remove(track)
+    return actor, imported, model_actions
 
 
 def apply_object_action(obj, name, start, frames):
@@ -484,6 +496,155 @@ def apply_object_action(obj, name, start, frames):
         obj.rotation_euler = (0, 0, 0)
         obj.keyframe_insert(data_path="rotation_euler", frame=end)
     return end
+
+
+# 逻辑动作名 -> 模型自带动画名的关键词（子串匹配，大小写不敏感）
+MODEL_ACTION_KEYWORDS = {
+    "wave": ("wave", "greet", "hello", "hello_"),
+    "walk": ("walk",),
+    "idle": ("idle",),
+    "spin": ("spin", "turn", "dance"),
+    "jump": ("jump",),
+    "talk": ("talk", "idle"),  # 这类模型多没有说话动画，退回待机
+    "bow": ("bow", "nodge", "thank"),
+    "nod": ("nod", "yes"),
+    "shake": ("shake", "no"),
+    "clap": ("clap",),
+    "sit": ("sit",),
+    "angry": ("anger", "fight"),
+    "smile": ("smile", "happy", "joy"),
+}
+
+
+def match_model_action(model_actions, logical: str):
+    """Find a clip shipped with the model matching a logical action, exact name first."""
+    keys = MODEL_ACTION_KEYWORDS.get(logical)
+    if not keys:
+        return None
+    # glTF import names actions "ArmatureName|ClipName"; keep the clip part
+    names = [(a, a.name.split("|")[-1].lower()) for a in model_actions]
+    for key in keys:
+        for act, nm in names:  # exact match first
+            if nm == key:
+                return act
+    for key in keys:
+        for act, nm in names:  # then substring
+            if key in nm:
+                return act
+    return None
+
+
+def apply_model_action(actor, act, start, frames):
+    """Play a model-authored clip on [start, start+frames] as an NLA strip.
+
+    Using NLA (rather than baking pose keys) means no bone renaming is needed — the clip was
+    authored for this exact armature. REPLACE blend + NOT_HOLD extrapolation keeps it from
+    leaking outside its own time window, so neighbouring procedural actions are unaffected.
+    """
+    import_ = actor.animation_data or actor.animation_data_create()
+    track = import_.nla_tracks.new()
+    strip = track.strips.new(act.name, 1, act)
+    strip.action = act
+    src = max(1, int(act.frame_range[1] - act.frame_range[0]))
+    strip.frame_start = start
+    strip.frame_end = start + frames
+    strip.scale = frames / src
+    strip.blend_type = "REPLACE"
+    strip.extrapolation = "NOTHING"
+    strip.influence = 1.0
+    strip.use_animated_time = False
+    return start + frames
+
+
+# 逻辑表情动作 -> blendshape 名关键词（匹配 mesh 的 shape keys）
+EXPRESSION_KEYWORDS = {
+    "blink": ("blink", "eyeblink", "eyeclose", "closeeye", "eye_close"),
+    "wink": ("wink",),
+    "smile": ("smile", "happy", "joy", "laugh"),
+    "talk": ("mouthopen", "mouth_open", "mouth", "jawopen", "talk", "aa", "viseme"),
+    "angry": ("anger", "browdown", "brow_down", "frown", "angry"),
+}
+
+
+def apply_expression_action(meshes, logical, start, frames):
+    """Drive real facial blendshapes for blink/wink/smile/talk/angry, if the model has them.
+
+    Falls back silently when a model ships no such shape key — the block-figure still animates
+    the Jaw bone via apply_action, so nothing is lost for low-asset models.
+    """
+    keys = EXPRESSION_KEYWORDS.get(logical)
+    if not keys:
+        return
+    mid = start + frames // 2
+    for obj in meshes:
+        sk = obj.data.shape_keys
+        if sk is None:
+            continue
+        hits = [kb for kb in sk.key_blocks if any(k in kb.name.lower() for k in keys)]
+        if not hits:
+            continue
+        # Blender 5.x no longer auto-creates animation_data/action on shape-key keyframe_insert,
+        # so the first insert would be dropped silently. Create and bind an action up front.
+        if sk.animation_data is None:
+            sk.animation_data_create()
+        if sk.animation_data.action is None:
+            act = bpy.data.actions.new(f"{obj.name}_ShapeKeys")
+            sk.animation_data.action = act
+            act.use_fake_user = True
+        for kb in hits:
+            kb.value = 0.0
+            kb.keyframe_insert(data_path="value", frame=start)
+            kb.value = 1.0
+            kb.keyframe_insert(data_path="value", frame=mid)
+            kb.value = 0.0
+            kb.keyframe_insert(data_path="value", frame=start + frames)
+
+
+def _action_has_curves(act) -> bool:
+    """Blender 4.4+ slotted actions keep fcurves under layers[].strips[].channelbags[].
+
+    Plain `act.fcurves` no longer exists on the Action itself in 5.x, so probe the tree.
+    """
+    try:
+        if act.fcurves:
+            return True
+    except AttributeError:
+        pass
+    for layer in getattr(act, "layers", ()) or ():
+        for strip in getattr(layer, "strips", ()) or ():
+            for bag in getattr(strip, "channelbags", ()) or ():
+                if bag.fcurves:
+                    return True
+                for chan in getattr(bag, "channels", ()) or ():
+                    if getattr(chan, "fcurves", None):
+                        return True
+    return False
+
+
+def push_active_to_nla(obj):
+    """Move an object's active action (procedural keyframes) into an NLA strip.
+
+    Blender 5.x evaluates `animation_data.action` as a base layer on top of the NLA stack; as
+    soon as any procedural keyframe lands there (e.g. blink sets eye-scale), the whole NLA
+    evaluation collapses and model-authored strips stop animating. So after all actions are
+    scheduled, we push the active action into its own strip and clear the slot.
+    """
+    ad = obj.animation_data
+    if ad is None or ad.action is None:
+        return
+    act = ad.action
+    if not _action_has_curves(act):
+        ad.action = None
+        return
+    track = ad.nla_tracks.new()
+    strip = track.strips.new(act.name, int(act.frame_range[0]), act)
+    strip.action = act
+    strip.frame_start = int(act.frame_range[0])
+    strip.frame_end = int(act.frame_range[1])
+    strip.scale = 1.0
+    strip.blend_type = "REPLACE"
+    strip.extrapolation = "NOTHING"
+    ad.action = None
 
 
 def configure_render(scene, start, end, video_path: Path):
@@ -536,12 +697,12 @@ def main():
         x = (i - (n - 1) / 2) * 1.45
         path = (slot or {}).get("model_path") or ""
         if path:
-            actor, _imported = import_model(Path(path), name=f"Actor{i}", offset_x=x)
-            actors.append((actor, uses_armature(actor)))
+            actor, imported, model_actions = import_model(Path(path), name=f"Actor{i}", offset_x=x)
+            actors.append((actor, uses_armature(actor), model_actions, imported))
         else:
             actor = create_rig(f"Actor{i}", CLOTH_COLORS[i % len(CLOTH_COLORS)])
             actor.location.x = x
-            actors.append((actor, True))
+            actors.append((actor, True, [], []))
 
     frame = 1
     timeline = []
@@ -551,15 +712,29 @@ def main():
         for _ in range(repeats):
             start = frame
             end = start
-            for actor, is_arm in actors:
+            for actor, is_arm, model_actions, imported in actors:
+                logical = action["name"]
+                used = None
                 if is_arm:
-                    end = apply_action(actor, action["name"], start, frames)
+                    # Prefer a clip the model itself ships (walk/run/idle/wave...) so it looks
+                    # like the authored character; fall back to our procedural bones otherwise.
+                    clip = match_model_action(model_actions, logical)
+                    if clip is not None:
+                        used = f"model:{clip.name}"
+                        end = apply_model_action(actor, clip, start, frames)
+                    else:
+                        end = apply_action(actor, logical, start, frames)
+                    if logical in EXPRESSION_KEYWORDS:
+                        meshes = [o for o in imported if o.type == "MESH"]
+                        apply_expression_action(meshes, logical, start, frames)
                 else:
-                    end = apply_object_action(actor, action["name"], start, frames)
-            timeline.append({"name": action["name"], "start": start, "end": end})
+                    end = apply_object_action(actor, logical, start, frames)
+            timeline.append({"name": action["name"], "start": start, "end": end, "source": used})
             frame = end + 2
 
     scene = bpy.context.scene
+    for actor, _is_arm, _acts, _imported in actors:
+        push_active_to_nla(actor)
     configure_render(scene, 1, frame, frames_dir / "frame_")
     bpy.ops.wm.save_as_mainfile(filepath=str(blend))
     bpy.ops.render.render(animation=True)
